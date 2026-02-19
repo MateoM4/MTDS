@@ -1,64 +1,114 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
-// ===== CONFIGURACIÓN AP (La red que crea el robot) =====
-const char* ssid = "MTDS_ROBOT_AP";
-const char* password = "robotseguro"; // Mínimo 8 caracteres
-const int localPort = 4210;           // Puerto de escucha UDP
+// =======================================================
+// CONFIGURACIÓN ACCESS POINT
+// =======================================================
 
-// ===== OBJETOS =====
+const char *ssid = "MTDS_ROBOT_AP";
+const char *password = "robotseguro";
+const uint16_t localPort = 4210;
+
+// =======================================================
+// CONFIGURACIÓN GENERAL
+// =======================================================
+
+constexpr uint8_t MAX_CLIENTS = 1;    // Solo 1 controlador
+constexpr uint32_t TIMEOUT_MS = 1000; // Tiempo máximo sin paquetes
+
 WiFiUDP udp;
-// UART hacia Arduino Mega
 HardwareSerial MegaSerial(2); // UART2 (RX=16, TX=17)
 
-// Buffer para paquetes entrantes
-char packetBuffer[255];
+unsigned long lastPacketTime = 0;
 
-void setup() {
+// =======================================================
+// DEFINICIÓN DEL PAQUETE BINARIO (3 BYTES EXACTOS)
+// =======================================================
+
+#pragma pack(push, 1)
+typedef struct __attribute__((packed))
+{
+  int16_t joyX; // Cambiado a 16 bits con signo
+  int16_t joyY; // Cambiado a 16 bits con signo
+  uint8_t pot;  // El pot de 0-255 está perfecto en 8 bits sin signo
+} DataPacket;
+#pragma pack(pop)
+
+// ACTUALIZAR EL CONTROL DE TAMAÑO
+static_assert(sizeof(DataPacket) == 5, "El struct no mide 5 bytes");
+
+// =======================================================
+// SETUP
+// =======================================================
+
+void setup()
+{
   Serial.begin(115200);
   MegaSerial.begin(115200, SERIAL_8N1, 16, 17);
 
-  // 1. Iniciar en modo Access Point (AP)
-  Serial.println("Iniciando Modo AP...");
-  WiFi.softAP(ssid, password);
-  
-  IPAddress myIP = WiFi.softAPIP();
-  Serial.print("Dirección IP del AP: ");
-  Serial.println(myIP); // Normalmente es 192.168.4.1
+  Serial.println("Iniciando Access Point...");
 
-  // 2. Iniciar escucha UDP
-  udp.begin(localPort);
+  // Iniciar AP en canal 6, visible, máximo 1 cliente
+  if (!WiFi.softAP(ssid, password, 6, false, MAX_CLIENTS))
+  {
+    Serial.println("Error iniciando Access Point");
+    while (true)
+      ; // Bloquear si falla
+  }
+
+  Serial.print("IP del AP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Iniciar UDP
+  if (!udp.begin(localPort))
+  {
+    Serial.println("Error iniciando UDP");
+    while (true)
+      ;
+  }
+
   Serial.printf("Escuchando UDP en puerto %d\n", localPort);
 }
 
-void loop() {
-  // Verificar si hay paquetes UDP disponibles
+// =======================================================
+// LOOP PRINCIPAL
+// =======================================================
+
+void loop()
+{
+
   int packetSize = udp.parsePacket();
-  
-  if (packetSize) {
-    // Leer el paquete
-    int len = udp.read(packetBuffer, 255);
-    if (len > 0) packetBuffer[len] = 0; // Terminar string
 
-    int vx = 0, vy = 0;
-    unsigned long sentTime = 0;
+  // Solo aceptamos paquetes EXACTAMENTE de 5 bytes
+  if (packetSize == sizeof(DataPacket))
+  {
 
-    // Esperamos formato: "vx,vy,timestamp"
-    if (sscanf(packetBuffer, "%d,%d,%lu", &vx, &vy, &sentTime) == 3) {
-      
-      // Cálculo de Latencia (Un solo viaje: Emisor -> Receptor)
-      unsigned long latency = millis() - sentTime;
+    DataPacket packet;
 
-      // Enviar al Mega (Protocolo robusto)
-      MegaSerial.printf("<%d,%d>\n", vx, vy);
+    int len = udp.read((uint8_t *)&packet, sizeof(packet));
 
-      // Diagnóstico de Latencia
-      Serial.printf("Latencia UDP: %lu ms | VX: %d\n", latency, vx);
-
-    } else {
-      Serial.println("Paquete corrupto o formato incorrecto");
+    if (len != sizeof(packet))
+    {
+      Serial.println("Error leyendo paquete");
+      return;
     }
+
+    int vx = packet.joyX;
+    int vy = packet.joyY;
+    int pot = packet.pot;
+
+    Serial.printf("VX:%d VY:%d POT:%d\n", vx, vy, pot);
+
+    // Enviar al Mega
+    MegaSerial.printf("<%d,%d,%d>\n", vx, vy, pot);
+
+    lastPacketTime = millis();
   }
-  // Nota: No necesitamos lógica de reconexión MQTT aquí.
-  // El Watchdog del Arduino Mega detendrá el robot si dejan de llegar paquetes.
+
+  // Seguridad por timeout
+  if (millis() - lastPacketTime > TIMEOUT_MS)
+  {
+    MegaSerial.println("<0,0,0>");
+    lastPacketTime = millis();
+  }
 }
